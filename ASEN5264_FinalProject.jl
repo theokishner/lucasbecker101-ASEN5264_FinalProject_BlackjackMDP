@@ -281,9 +281,144 @@ baseline_score = [
     for _ in 1:10000
 ]
 
-println(baseline_score[1:25])  # print first 10 rewards for sanity check
+println(baseline_score[1:10])  # print first 10 rewards for sanity check
 println("Mean reward: ", mean(baseline_score))
 println("Std error: ", std(baseline_score) / sqrt(length(baseline_score)))
 
+# ----------- Q-LEARNING Implementation ----------- #
+function qlearning_episode!(Q, mdp; ϵ=0.10, γ=1.0, α=0.2)
+    start = time()
+    
+    # Epsilon-greedy policy (Compatible with all Julia versions)
+    function policy(s)
+        if rand() < ϵ
+            return rand(ACTIONS)
+        else
+            # Safely get Q-values and find the index of the max
+            q_vals = [get(Q, (s, a), 0.0) for a in ACTIONS]
+            return ACTIONS[argmax(q_vals)]
+        end
+    end
 
+    # 1. Safe Initialization (bypasses the Deterministic fallback bug)
+    init_dist = initialstate(mdp)
+    s = init_dist isa Deterministic ? init_dist.val : rand(init_dist)
+    a = policy(s)
+    
+    hist = typeof(s)[]
+    push!(hist, s)
+
+    while !s.terminal
+        # 2. Transition and Reward (Using POMDPs.jl API, not CommonRLInterface)
+        dist = transition(mdp, s, a)
+        
+        # Safely extract state to avoid the "not callable" error
+        sp = rand(transition(mdp, s, a))
+        
+        r = reward(mdp, s, a, sp)
+
+        # 3. Update Q-Table safely
+        best_next_q = maximum([get(Q, (sp, a_next), 0.0) for a_next in ACTIONS])
+        current_q = get(Q, (s, a), 0.0)
+        Q[(s, a)] = current_q + α * (r + γ * best_next_q - current_q)
+
+        # 4. Step forward
+        s = sp
+        a = policy(sp)
+        push!(hist, sp)
+    end
+
+    return (hist=hist, Q=copy(Q), time=time()-start)
+end
+
+function qlearning!(mdp; n_episodes = 10000, α=0.2)
+    # Start with an empty Dict, typed to your specific State/Action pairs
+    Q = Dict{Tuple{BJState, Symbol}, Float64}()
+    episodes = []
+    
+    for i in 1:n_episodes
+        push!(episodes, qlearning_episode!(Q, mdp;
+                                           ϵ=max(0.1, 1 - i/n_episodes), α=α))
+    end
+    
+    return episodes
+end
+
+# ----------- Evaluation Function ----------- #
+# This replaces your old evaluate function to work with POMDPs instead of CommonRLInterface
+function evaluate(mdp, Q; n_episodes=1000)
+    function greedy_policy(m, s)
+        q_vals = [get(Q, (s, a), 0.0) for a in ACTIONS]
+        return ACTIONS[argmax(q_vals)]
+    end
+    
+    returns = Float64[]
+    for _ in 1:n_episodes
+        init_dist = POMDPs.initialstate(mdp)
+        s0 = init_dist isa Deterministic ? init_dist.val : rand(init_dist)
+        push!(returns, rollout(mdp, greedy_policy, s0, 10))
+    end
+    
+    return returns
+end
+
+# Run Q-Learning
+num_episodes = 10000
+qlearning_episodes = qlearning!(m_onedeck, n_episodes=num_episodes, α=0.075)
+episodes_dict = Dict("Q-Learning" => qlearning_episodes)
+
+# ----------- Plotting Learning Curves --------- # 
+function learning_curve_steps(episodes_dict, mdp)
+    p = plot(xlabel="Steps in environment", ylabel="Avg return", legend=:bottomright)
+    n = 1000
+    stop = num_episodes
+    
+    for (name, eps) in episodes_dict
+        xs = [0]
+        # Evaluate empty Q-table
+        ys = [mean(evaluate(mdp, Dict{Tuple{BJState, Symbol}, Float64}()))] 
+        
+        for i in n:n:min(stop, length(eps))
+            newsteps = sum(length(ep.hist) for ep in eps[i-n+1:i])
+            push!(xs, last(xs) + newsteps)
+            
+            Q = eps[i].Q
+            push!(ys, mean(evaluate(mdp, Q)))
+        end    
+        plot!(p, xs, ys, label=name)
+    end
+    return p
+end
+
+p_steps = learning_curve_steps(episodes_dict, m_onedeck)
+display(p_steps)
+
+# ----------- Final Evaluation & Comparison ----------- #
+
+# 1. Grab the final Q-table from the very last episode of training
+final_Q = qlearning_episodes[end].Q
+
+# 2. Evaluate the learned policy for 10,000 episodes (same as baseline)
+println("Evaluating final Q-learning policy...")
+q_scores = evaluate(m_onedeck, final_Q, n_episodes=10000)
+
+# 3. Calculate means and standard errors
+mean_baseline = mean(baseline_score)
+se_baseline = std(baseline_score) / sqrt(length(baseline_score))
+
+mean_q = mean(q_scores)
+se_q = std(q_scores) / sqrt(length(q_scores))
+
+# 4. Print a nice comparison table
+println("\n" * "="^40)
+println("     BASELINE VS. Q-LEARNING RESULTS    ")
+println("="^40)
+println("Baseline (Hit if <= 15):")
+println("  Mean Return: ", round(mean_baseline, digits=4))
+println("  Std Error:   ", round(se_baseline, digits=4))
+println("-"^40)
+println("Q-Learning (10,000 episodes):")
+println("  Mean Return: ", round(mean_q, digits=4))
+println("  Std Error:   ", round(se_q, digits=4))
+println("="^40)
 
