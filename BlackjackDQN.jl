@@ -13,10 +13,11 @@ struct BJState
     dealer_upcard::Int
     usable_ace::Bool
     deck_counts::NTuple{10, Int}  # [A,2,...,10]
+    first_action::Bool
     terminal::Bool
 end
 
-const ACTIONS = [:hit, :stick]
+const ACTIONS = [:hit, :stick, :double]
 
 ############################
 # HELPERS
@@ -98,6 +99,41 @@ function bj_transition(s::BJState, a)
 
     deck = s.deck_counts
 
+    # --- DOUBLE DOWN ---
+    if a == :double
+        # If the agent tries to double down illegally, force a stick or penalize.
+        # We will handle the penalty in the reward function, but functionally, 
+        # it just acts like a hit that immediately ends the hand.
+        dist = draw_card_dist(deck)
+        states = BJState[]
+        probs = Float64[]
+
+        for card in 1:10
+            p = pdf(dist, card)
+            if p == 0.0 continue end
+
+            new_deck = remove_card(deck, card)
+            new_sum, usable = update_sum(s.player_sum, s.usable_ace, card)
+            new_sum, usable = adjust_for_ace(new_sum, usable)
+
+            # We must immediately resolve the dealer's turn because the player is forced to stick
+            dealer_out = dealer_outcomes(s.dealer_upcard, new_deck)
+            
+            for (dealer_sum, d_prob) in dealer_out
+                push!(states, BJState(
+                    new_sum, 
+                    dealer_sum, 
+                    usable, 
+                    s.deck_counts, # Dealer deck depletion is abstracted in outcomes
+                    false, 
+                    true           # Terminal!
+                ))
+                push!(probs, p * d_prob)
+            end
+        end
+        return SparseCat(states, probs)
+    end
+
     # HIT
     if a == :hit
         dist = draw_card_dist(deck)
@@ -123,6 +159,7 @@ function bj_transition(s::BJState, a)
                 s.dealer_upcard,
                 usable,
                 new_deck,
+                false,
                 terminal
             ))
             push!(probs, p)
@@ -144,7 +181,8 @@ function bj_transition(s::BJState, a)
              dealer_sum,   # store final dealer result
              s.usable_ace,
              s.deck_counts,
-             true
+             false,
+             true,
         )
             push!(states, terminal_state)
             push!(probs, p)
@@ -160,29 +198,41 @@ end
 # REWARD
 ############################
 function bj_reward(s::BJState, a, sp::BJState)
-    # 1. If we are ALREADY in a terminal state, no more rewards are given.
-    if s.terminal
+    if s.terminal || !sp.terminal
         return 0.0
     end
 
-    # 2. If the NEXT state is not terminal, no reward is given yet.
-    if !sp.terminal
-        return 0.0
+    # 1. Illegal Action Penalty
+    if a == :double && !s.first_action
+        return -2.0 # Massive penalty for breaking the rules
     end
 
-    # 3. Calculate final win/loss/draw
+    # 2. Base Multipliers
+    bet_mult = (a == :double) ? 2.0 : 1.0
+
+    # 3. Natural Blackjack (3:2 Payout)
+    # If we stick immediately on a 21, and the dealer doesn't also have 21
+    if s.first_action && a == :stick && s.player_sum == 21
+        if sp.dealer_upcard != 21 # dealer_upcard stores final dealer sum here
+            return 1.5 
+        else
+            return 0.0 # Push (Tie)
+        end
+    end
+
+    # 4. Standard Win/Loss/Draw
     if sp.player_sum > 21
-        return -1.0
+        return -1.0 * bet_mult
     end
 
-    dealer_sum = sp.dealer_upcard  # overloaded as final result
+    dealer_sum = sp.dealer_upcard 
 
     if dealer_sum > 21 || sp.player_sum > dealer_sum
-        return 1.0
+        return 1.0 * bet_mult
     elseif sp.player_sum == dealer_sum
         return 0.0
     else
-        return -1.0
+        return -1.0 * bet_mult
     end
 end
 
@@ -204,7 +254,7 @@ function build_initial_dist()
         new_deck = remove_card(init_deck, card)
         
         # Player sum starts at 0, dealer has their upcard
-        push!(states, BJState(0, card, false, new_deck, false))
+        push!(states, BJState(0, card, false, new_deck, true, false))
         push!(probs, p)
     end
     
@@ -216,12 +266,9 @@ initial_dist = build_initial_dist()
 ############################
 # MDP
 ############################
-############################
-# MDP
-############################
 m_onedeck = QuickPOMDP(
     actions = ACTIONS,
-    discount = 0.995,
+    discount = 1.0,
 
     transition = bj_transition,
     reward = bj_reward,
@@ -287,19 +334,19 @@ println("Mean reward: ", mean(baseline_score))
 println("Std error: ", std(baseline_score) / sqrt(length(baseline_score)))
 
 # Map actions to indices for network outputs
-const ACTION_TO_IDX = Dict(:hit => 1, :stick => 2)
-const IDX_TO_ACTION = Dict(1 => :hit, 2 => :stick)
+const ACTION_TO_IDX = Dict(:hit => 1, :stick => 2, :double => 3)
+const IDX_TO_ACTION = Dict(1 => :hit, 2 => :stick, 3 => :double)
 
 function state_to_vec(s::BJState)
-    # Calculate total remaining cards to find probabilities
     total_remaining = max(1, sum(s.deck_counts)) 
     norm_counts = [c / total_remaining for c in s.deck_counts]
     
     return Float32.([
-        s.player_sum / 21.0,       # Normalize to max possible non-bust value
-        s.dealer_upcard / 10.0,    # Normalize to max face value
+        s.player_sum / 21.0,      
+        s.dealer_upcard / 10.0,   
         s.usable_ace ? 1.0 : 0.0, 
-        norm_counts...             # Now represents the % chance of drawing each card
+        s.first_action ? 1.0 : 0.0, # <-- Let the network know if it can double!
+        norm_counts...             
     ])
 end
 
@@ -338,8 +385,8 @@ end
 
 function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=500_000, γ=1.0)
     # 1. Initialize Networks
-    input_size = 13 # Length of state_to_vec output
-    output_size = 2 # Hit or Stick
+    input_size = 14 # Length of state_to_vec output
+    output_size = 3 # Hit, Stick, or Double Down
     
     q_net = create_q_network(input_size, output_size)
     target_net = deepcopy(q_net) # Copy for stable targets
@@ -457,7 +504,7 @@ end
 
 # Execution
 println("Training DQN...")
-trained_model, train_history = train_dqn!(m_onedeck, n_episodes=100_000)
+trained_model, train_history = train_dqn!(m_onedeck, n_episodes=250_000)
 
 println("Evaluating DQN...")
 dqn_scores = evaluate_dqn(m_onedeck, trained_model)
