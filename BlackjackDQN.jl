@@ -336,7 +336,7 @@ function create_q_network(input_size::Int, output_size::Int)
     )
 end
 
-function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=10000, γ=1.0)
+function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=500_000, γ=1.0)
     # 1. Initialize Networks
     input_size = 13 # Length of state_to_vec output
     output_size = 2 # Hit or Stick
@@ -344,7 +344,7 @@ function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=10000, γ=1.
     q_net = create_q_network(input_size, output_size)
     target_net = deepcopy(q_net) # Copy for stable targets
     
-    opt_state = Flux.setup(Adam(0.001), q_net)
+    opt_state = Flux.setup(Adam(5e-5), q_net)
     buffer = ReplayBuffer(capacity)
     
     target_update_freq = 5000
@@ -392,17 +392,22 @@ function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=10000, γ=1.
                 Term_batch = Bool.([b.term for b in batch])   # Batch
                 A_batch = [b.a for b in batch]                # Batch
                 
-                # Calculate Targets using the Target Network
-                target_q_vals = target_net(Sp_batch) # 2 x Batch
-                max_target_q = maximum(target_q_vals, dims=1)[1, :] 
+                # --- DOUBLE DQN UPGRADE ---
+                # 1. Use the MAIN network to choose the best action for the next state
+                main_next_q = q_net(Sp_batch) 
+                best_next_actions = [argmax(main_next_q[:, i]) for i in 1:batch_size]
+
+                # 2. Use the TARGET network to evaluate the value of that chosen action
+                target_next_q = target_net(Sp_batch) 
+                max_target_q = Float32.([target_next_q[best_next_actions[i], i] for i in 1:batch_size])
+                # --------------------------
                 
-                # Bellman Equation Target: r + gamma * max(Q(s', a'))
+                # Bellman Equation Target
                 y = R_batch .+ Float32(γ) .* max_target_q .* .!Term_batch
                 
                 # Compute gradients and update Q-network
                 loss, grads = Flux.withgradient(q_net) do net
-                    preds = net(S_batch) # 2 x Batch
-                    # Select the Q-values corresponding to the actions actually taken
+                    preds = net(S_batch) 
                     selected_preds = [preds[A_batch[i], i] for i in 1:batch_size]
                     Flux.mse(selected_preds, y)
                 end
@@ -427,7 +432,7 @@ function train_dqn!(mdp; n_episodes=10000, batch_size=256, capacity=10000, γ=1.
     return q_net, returns
 end
 
-function evaluate_dqn(mdp, trained_q_net; n_episodes=10000)
+function evaluate_dqn(mdp, trained_q_net; n_episodes=10_000)
     returns = Float64[]
     
     for _ in 1:n_episodes
@@ -452,7 +457,7 @@ end
 
 # Execution
 println("Training DQN...")
-trained_model, train_history = train_dqn!(m_onedeck, n_episodes=10000)
+trained_model, train_history = train_dqn!(m_onedeck, n_episodes=100_000)
 
 println("Evaluating DQN...")
 dqn_scores = evaluate_dqn(m_onedeck, trained_model)
